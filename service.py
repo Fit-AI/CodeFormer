@@ -9,6 +9,7 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 
 import httpx
+import ffmpeg
 import socket
 import requests
 import httpcore
@@ -19,14 +20,16 @@ from flask import (
         request,
         jsonify
         )
-import storage3
 from supabase import (
         create_client,
         Client
         )
+import storage3
+
+from tqdm import tqdm
 
 import cv2
-
+import torch
 from torchvision.transforms.functional import normalize
 from basicsr.utils import imwrite, img2tensor, tensor2img
 from basicsr.utils.download_util import load_file_from_url
@@ -78,57 +81,139 @@ def upload_to_supabase(storage, key, target):
             time.sleep(1)
             continue
 
+def set_realesrgan():
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from basicsr.utils.realesrgan_utils import RealESRGANer
+    model = RRDBNet(num_in_ch=3,
+                    num_out_ch=3,
+                    num_feat=64,
+                    num_block=23,
+                    num_grow_ch=32,
+                    scale=2)
+    bg_tile = 400
+
+    bg_upsampler = RealESRGANer(
+        scale=2,
+        model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
+        model=model,
+        tile=bg_tile,
+        tile_pad=40,
+        pre_pad=0,
+        half=True)  # need to set False in CPU mode
+    return bg_upsampler
+
 class Upscaler(object):
 
     INPUT_VIDEO = 'inputs/input_video.mp4'
-    TEMP_PATH = 'temp/input_video.mp4'
+    RESULTS_PATH = 'results/'
+    TEMP_PATH = 'temp/'
 
     def __init__(self):
-        # Create sim-swap
-        self.model = create_model(self.opt)
-        self.model.eval()
-        # Create face-detection
-        self.app = Face_detect_crop(name='antelope', root='./insightface_func/models')
-        self.app.prepare(ctx_id= 0, det_thresh=0.6, det_size=(640,640),mode=mode)
+        self.upsampler = set_realesrgan()
 
-    def codeformer(self)-> dict:
+        self.device = torch.device('cuda')
+        self.net = ARCH_REGISTRY.get('CodeFormer')(dim_embd=512, codebook_size=1024, n_head=8, n_layers=9,
+                                                   connect_list=['32', '64', '128', '256']).to(self.device)
+        ckpt_path = load_file_from_url(url=pretrain_model_url['restoration'],
+                                        model_dir='weights/CodeFormer', progress=True, file_name=None)
+        checkpoint = torch.load(ckpt_path)['params_ema']
+        self.net.load_state_dict(checkpoint)
+        self.net.eval()
+
+        UPSCALE = 2
+        self.face_helper = FaceRestoreHelper(UPSCALE,
+                                        face_size=512,
+                                        crop_ratio=(1, 1),
+                                        det_model='retinaface_resnet50',
+                                        save_ext='png',
+                                        use_parse=True,
+                                        device=self.device)
+        logging.info('Initialized')
+
+    def codeformer(self, w=0.9, max_frames=sys.maxsize, upscale_background=False)-> dict:
         assert os.path.isfile(Upscaler.INPUT_VIDEO)
-        shutil.rmtree('temp', ignore_errors=True)
-        os.makedirs('temp')
-        shutil.rmtree('outputs', ignore_errors=True)
-        os.makedirs('outputs')
+        shutil.rmtree(Upscaler.TEMP_PATH, ignore_errors=True)
+        os.makedirs(Upscaler.TEMP_PATH)
 
-        with torch.no_grad():
-            pic_a = Upscaler.INPUT_IMAGE
-            assert os.path.isfile(pic_a)
-            img_a = Image.open(pic_a).convert('RGB')
-            img_a_whole = cv2.imread(pic_a)
-            img_a_align_crop, _ = self.app.get(img_a_whole, self.crop_size)
-            img_a_align_crop_pil = Image.fromarray(cv2.cvtColor(img_a_align_crop[0], cv2.COLOR_BGR2RGB))
-            img_a = transformer_Arcface(img_a_align_crop_pil)
-            img_id = img_a.view(-1, img_a.shape[0], img_a.shape[1], img_a.shape[2])
-            img_id = img_id.cuda()
-            # Latent ID
-            img_id_downsample = F.interpolate(img_id, size=(112,112))
-            latend_id = self.model.netArc(img_id_downsample)
-            latend_id = F.normalize(latend_id, p=2, dim=1)
-            # Swap
-            video_swap(self.opt.video_path,
-                       latend_id,
-                       self.model,
-                       self.app,
-                       self.opt.output_path,
-                       temp_results_dir=self.opt.temp_path,
-                       no_simswaplogo=self.opt.no_simswaplogo,
-                       use_mask=self.opt.use_mask,
-                       crop_size=self.crop_size)
+        video = cv2.VideoCapture(Upscaler.INPUT_VIDEO)
+        frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = video.get(cv2.CAP_PROP_FPS)
 
-            storage = storage_for_bucket('dev-codeformer')
-            key = str(uuid.uuid4())
-            result_url = upload_to_supabase(storage,
-                                            key,
-                                            'results/result.mp4')
-            return {'result': result_url}
+        print (f'[{frame_count}] frames @ [{fps}] fps')
+
+        os.makedirs(os.path.join(Upscaler.RESULTS_PATH, 'cropped_faces'))
+        os.makedirs(os.path.join(Upscaler.RESULTS_PATH, 'restored_faces'))
+        os.makedirs(os.path.join(Upscaler.RESULTS_PATH, 'final_results'))
+
+        for frame_index in tqdm(range(frame_count)):
+            self.face_helper.clean_all()
+            if frame_index > max_frames:
+                logging.info(f'Breaking after {frame_index} frames')
+                break
+            ret, img = video.read()
+            if not ret:
+                logging.error(f'Failed to decode {frame_index}')
+                break
+
+            # cv2.imwrite(f'temp/{frame_index:06d}.png', img)
+            self.face_helper.read_image(img)
+            only_center_face=False
+            num_det_faces = self.face_helper.get_face_landmarks_5(only_center_face=only_center_face,
+                                                                  resize=640,
+                                                                  eye_dist_threshold=5)
+            self.face_helper.align_warp_face()
+
+            for idx, cropped_face in enumerate(self.face_helper.cropped_faces):
+                cropped_face_t = img2tensor(cropped_face / 255., bgr2rgb=True, float32=True)
+                normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+                cropped_face_t = cropped_face_t.unsqueeze(0).to(self.device)
+                try:
+                    with torch.no_grad():
+                        output = self.net(cropped_face_t, w=w, adain=True)[0]
+                        restored_face = tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
+                    del output
+                    torch.cuda.empty_cache()
+                except Exception as error:
+                    print(f'\tFailed inference for CodeFormer: {error}')
+                    restored_face = tensor2img(cropped_face_t, rgb2bgr=True, min_max=(-1, 1))
+
+                restored_face = restored_face.astype('uint8')
+                self.face_helper.add_restored_face(restored_face)
+
+            self.face_helper.get_inverse_affine(None)
+            # bg_img = self.upsampler.enhance(img, outscale=2)[0]
+            restored_img = self.face_helper.paste_faces_to_input_image(upsample_img=None,
+                                                                       draw_box=False,
+                                                                       face_upsampler=self.upsampler)
+            basename = 'input_video'
+            save_intermediates = False
+            if save_intermediates:
+                for idx, (cropped_face, restored_face) in enumerate(zip(self.face_helper.cropped_faces, self.face_helper.restored_faces)):
+                    save_crop_path = os.path.join(Upscaler.RESULTS_PATH,
+                                                  'cropped_faces',
+                                                  f'{basename}_{frame_index:02d}_{idx:02d}.png')
+                    cv2.imwrite(save_crop_path, cropped_face)
+                    save_face_name = f'{basename}_{frame_index:02d}_{idx:02d}.png'
+                    save_restore_path = os.path.join(Upscaler.RESULTS_PATH,
+                                                     'restored_faces',
+                                                     save_face_name)
+                    cv2.imwrite(save_restore_path, restored_face)
+
+            # Save result
+            save_restore_path = os.path.join(Upscaler.RESULTS_PATH,
+                                             'final_results',
+                                             f'{basename}_{frame_index:06d}.png')
+            cv2.imwrite(save_restore_path, restored_img)
+
+        FINAL_RESULTS_PATH = os.path.join(Upscaler.RESULTS_PATH, 'final_results')
+        ffmpeg.input(f'{FINAL_RESULTS_PATH}/*.png', pattern_type='glob', framerate=fps).output(f'{Upscaler.RESULTS_PATH}/result.mp4', **{'qscale:v':0, 'c:v':'mpeg4'}).run()
+        storage = storage_for_bucket('dev-codeformer')
+        result_url = upload_to_supabase(storage,
+                                        str(uuid.uuid4()),
+                                        'results/result.mp4')
+        return [{'result': result_url,
+                 'parameters': {'w':
+                                w}}]
 
 def download_video(url, local_filename):
     with requests.get(url, stream=True) as r:
@@ -148,11 +233,18 @@ def livez():
 @app.route('/codeformer', methods=['GET', 'POST'])
 def codeformer():
     content_type = request.headers.get('Content-Type')
-    video_url = request.json['video']
-    logging.info(f'Running codeformer {target_url} on {video_url}')
+    instances = request.json['instances']
+    instance = instances[0]
+    # Parameters
+    video_url = instance['video']
+    w = instance.get('w', 0.5)
+    upscale = instance.get('upscale', 1)
+    max_frames = instance.get('max_frames', sys.maxsize)
+    upscale_background = instance.get('upscale_background', False)
     shutil.rmtree('inputs', ignore_errors=True)
     os.makedirs('inputs')
-    shutil.rmtree('results', ignore_errors=True)
-    os.makedirs('results')
+    shutil.rmtree(Upscaler.RESULTS_PATH, ignore_errors=True)
+    os.makedirs(Upscaler.RESULTS_PATH)
     download_video(video_url, Upscaler.INPUT_VIDEO)
-    return swapper.codeformer()
+    logging.info(f'Running codeformer {video_url}')
+    return jsonify({'predictions': swapper.codeformer(w=w, max_frames=max_frames, upscale_background=upscale_background)})

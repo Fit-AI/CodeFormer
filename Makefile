@@ -9,6 +9,7 @@ ifndef SUPABASE_URL
 endif
 
 codeformer: environment
+	python3 -m py_compile service.py
 	docker build -t gcr.io/savvy-webbing-347620/codeformer-api-vertex:latest \
 				 --build-arg SUPABASE_URL_ARG=${SUPABASE_URL} 	\
 				 --build-arg SUPABASE_KEY_ARG=${SUPABASE_KEY} 	\
