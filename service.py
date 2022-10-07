@@ -30,6 +30,7 @@ from tqdm import tqdm
 
 import cv2
 import torch
+assert torch.cuda.is_available()
 from torchvision.transforms.functional import normalize
 from basicsr.utils import imwrite, img2tensor, tensor2img
 from basicsr.utils.download_util import load_file_from_url
