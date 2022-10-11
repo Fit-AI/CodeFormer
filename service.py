@@ -207,7 +207,7 @@ class Upscaler(object):
             cv2.imwrite(save_restore_path, restored_img)
 
         FINAL_RESULTS_PATH = os.path.join(Upscaler.RESULTS_PATH, 'final_results')
-        ffmpeg.input(f'{FINAL_RESULTS_PATH}/*.png', pattern_type='glob', framerate=fps).output(f'{Upscaler.RESULTS_PATH}/result.mp4', **{'qscale:v':0, 'c:v':'mpeg4'}).run()
+        ffmpeg.input(f'{FINAL_RESULTS_PATH}/*.png', pattern_type='glob', framerate=fps).output(f'{Upscaler.RESULTS_PATH}/result.mp4', **{'qscale:v':0, 'c:v':'libx264', 'pix_fmt':'yuv420p'}).run()
         storage = storage_for_bucket('dev-codeformer')
         result_url = upload_to_supabase(storage,
                                         str(uuid.uuid4()),
